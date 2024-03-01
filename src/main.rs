@@ -1,23 +1,44 @@
-#[macro_use]
 extern crate lazy_static;
 use futures::StreamExt;
 use log::{info, warn};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 use std::env;
-use std::io::Cursor;
-use rodio::{Decoder, OutputStream, Source}; // Add `Source` here
 use base64;
 use std::process::Command;
 use std::io::{self};
 use tokio::sync::Mutex;
 use lazy_static::lazy_static;
 use std::fs;
+use std::sync::Arc;
+use std::collections::HashMap;
+
+//Confiuration for Level 1 algorithm that analyzes the audio stream to detect speech when the amplitude is consectively above the AMPLITUDE_THRESHOLD for SEQUENCE_THRESHOLD
+const SPEACH_DETECTION_AMPLITUDE_THRESHOLD: i16 = 5000;
+const SPEACH_DETECTION_SEQUENCE_THRESHOLD: usize = 5;
+
+//Configuration for Level 1 algorithm that analyzes the audio stream to detect pauses when the amplitude is consectively below the AMPLITUDE_THRESHOLD for SEQUENCE_THRESHOLD
+const PAUSE_DETECTION_AMPLITUDE_THRESHOLD: i16 = 2000;
+const PAUSE_DETECTION_SEQUENCE_THRESHOLD: usize = 15;
+
+const WAV_GENERATION_SEQUENCE_THRESHOLD: usize = 250;
+
+//Level 2 algorithm based upon both Level 1 algorithms to detect the start and end of an audio clip based on the amount of times the spech or pauses are consequtively triggered.
+const MIN_CONSECUTIVE_SPEECH_COUNT: usize = 5;
+const MIN_CONSECUTIVE_PAUSE_COUNT: usize = 3;
+const OFFSET:i32 = 10;
+
+#[derive(Debug, PartialEq)]
+enum AudioState {
+    Idle,
+    InSpeech,
+    PostSpeech,
+}
 
 //Start a webserver to handle websockets
 #[tokio::main]
 async fn main() {
-    env::set_var("RUST_LOG", "info");
+    env::set_var("RUST_LOG", "warn");
     env_logger::init();
 
     // Define the WebSocket route
@@ -36,11 +57,22 @@ async fn main() {
 
 lazy_static! {
     static ref AUDIO_QUEUE: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
+
+    static ref PAUSE_QUEUE: Mutex<Vec<i16>> = Mutex::new(Vec::new());
+    
+    static ref SPEACH_QUEUE: Mutex<Vec<i16>> = Mutex::new(Vec::new());
+
+    static ref AUDIO_CLIP_STATE: Mutex<AudioState> = Mutex::new(AudioState::Idle);
+    static ref CONSECUTIVE_SPEECH_COUNT: Mutex<usize> = Mutex::new(0);
+    static ref CONSECUTIVE_PAUSE_COUNT: Mutex<usize> = Mutex::new(0);
+    static ref CURRENT_CLIP_START: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+
+    static ref MESSAGES: Mutex<HashMap<i32, String>> = Mutex::new(HashMap::new());
 }
 
 //1 Handle WebSocket connection and pass messages to the handle_message
 async fn handle_connection(ws: WebSocket) {
-    info!("Connection accepted");
+    warn!("Connection accepted");
 
     let (_sender, mut receiver) = ws.split();
 
@@ -59,7 +91,7 @@ async fn handle_connection(ws: WebSocket) {
         }
     }
 
-    info!("Connection closed. Received a total of {} messages", message_count);
+    warn!("Connection closed. Received a total of {} messages", message_count);
 }
 
 //2 This is called everytime the websocket sends something in the stream. Hundreds in a few seconds. The sequenceNumber is how we can queue them up.
@@ -71,24 +103,117 @@ async fn handle_message(msg: &Message) {
 
         if let Some("media") = data["event"].as_str() {
             let sequence_number = data["sequenceNumber"].as_str().unwrap().parse::<i32>().unwrap();
-            let payload = data["media"]["payload"].as_str().unwrap();
+            let payload = data["media"]["payload"].as_str().unwrap();  
+            let audio_chunk = base64::decode(payload).expect("Failed to decode base64");
+            let amplitude = calculate_amplitude(&audio_chunk);  // Detect the Amplitute
 
-            // Queue the message
-            let mut queue = AUDIO_QUEUE.lock().await;
-            queue.push((sequence_number, payload.to_string()));
+            //Save each message against the sequence number
+            let mut messages = MESSAGES.lock().await;
+            messages.insert(sequence_number, payload.to_string());
 
-            // Process in batches
-            if queue.len() >= 250 {
-                // Example: Get the last sequence number in the batch for naming
-                let last_sequence = queue.last().unwrap().0;
-                let batch = queue.drain(..).collect::<Vec<_>>();
-                process_audio_batch(batch, last_sequence).await;
+            //Pause Detection
+            let mut pause_queue = PAUSE_QUEUE.lock().await;
+            pause_queue.push(amplitude);         
+            if pause_queue.len() > PAUSE_DETECTION_SEQUENCE_THRESHOLD {
+                pause_queue.remove(0); // Maintain only the most recent amplitudes up to the sequence threshold
+            }
+            let pause_detected = pause_queue.iter()
+                .filter(|&&amp| amp < PAUSE_DETECTION_AMPLITUDE_THRESHOLD)
+                .count() >= PAUSE_DETECTION_SEQUENCE_THRESHOLD;
+            if pause_detected {
+                info!("Pause detected.");  
+                pause_queue.clear(); // Reset the recent amplitudes to avoid repetitive pause detection
+            }
+
+            //Speach Detection
+            let mut speach_queue = SPEACH_QUEUE.lock().await;
+            speach_queue.push(amplitude); 
+            if speach_queue.len() > PAUSE_DETECTION_SEQUENCE_THRESHOLD {
+                speach_queue.remove(0); // Maintain only the most recent amplitudes up to the sequence threshold
+            }
+            let speach_detected = speach_queue.iter()
+                .filter(|&&amp| amp > SPEACH_DETECTION_AMPLITUDE_THRESHOLD)
+                .count() >= SPEACH_DETECTION_SEQUENCE_THRESHOLD;
+            if speach_detected {
+                info!("Speach detected.");                 
+                speach_queue.clear(); // Reset the recent amplitudes to avoid repetitive detection
+            }
+
+            //.WAV file generation from batches of messages
+            // let mut audio_queue = AUDIO_QUEUE.lock().await;
+            // audio_queue.push((sequence_number, payload.to_string()));
+            // if audio_queue.len() >= WAV_GENERATION_SEQUENCE_THRESHOLD {
+            //     // Example: Get the last sequence number in the batch for naming
+            //     let last_sequence = audio_queue.last().unwrap().0;
+            //     let batch = audio_queue.drain(..).collect::<Vec<_>>();
+            //     process_audio_batch(batch, last_sequence).await;
+            // }
+
+            //Start and end detection. This is how we would know to send the .wav file to our voice to text service
+            if speach_detected || pause_detected //Import we only do this when there is a Speach detected or Pause detected event
+            {
+                let mut state = AUDIO_CLIP_STATE.lock().await;
+                let mut speech_count = CONSECUTIVE_SPEECH_COUNT.lock().await;
+                let mut pause_count = CONSECUTIVE_PAUSE_COUNT.lock().await;
+                let mut clip_start = CURRENT_CLIP_START.lock().await;
+                match *state {
+                    AudioState::Idle => {
+                        info!("State: Idle, Speech Count: {}", *speech_count);
+                        if speach_detected {
+                            *speech_count += 1;
+                            if *speech_count >= MIN_CONSECUTIVE_SPEECH_COUNT {
+                                *state = AudioState::InSpeech;
+                                *clip_start = Some(sequence_number); // Mark the start of speech
+                                warn!("Clip started at sequence: {}", sequence_number - OFFSET);
+                                *speech_count = 0; // Reset speech count after transitioning
+                            }
+                        } else {
+                            // If no speech is detected, keep the state as Idle and reset speech count
+                            *speech_count = 0;
+                        }
+                    },
+                    AudioState::InSpeech => {
+                        info!("State: InSpeech, Speech Count: {}, Pause Count: {}", *speech_count, *pause_count);
+                        if pause_detected {
+                            *pause_count += 1;
+                            if *pause_count >= MIN_CONSECUTIVE_PAUSE_COUNT {
+                                *state = AudioState::PostSpeech;
+                                warn!("Clip ended at sequence: {}", sequence_number + OFFSET);
+
+                                // Here you can process the audio clip defined by clip_start and this sequence_number
+                                *pause_count = 0; // Reset pause count after confirming the end of a clip
+                            }
+                        } else {
+                            // If speech continues, reset pause count to wait for a clear end of the clip
+                            *pause_count = 0;
+                        }
+                    },
+                    AudioState::PostSpeech => {
+                        if let Some(start) = *clip_start {
+                            let end = sequence_number; 
+                            warn!("Processing from sequence {} to {}", start, end);
+                            
+                            // Spawn a new asynchronous task to process the audio clip
+                            let start_clone = start; // Clone data as needed for the async block
+                            let end_clone = end;
+                            tokio::spawn(async move {
+                                process_audio_clip(start_clone, end_clone).await;
+                            });
+                        }
+                    
+                        info!("State: PostSpeech, Resetting for next clip");
+                        // After processing the clip, prepare for the next potential clip
+                        *state = AudioState::Idle;
+                        *clip_start = None; // Clear the start marker for the next clip
+                        // No need to reset speech_count or pause_count here as they are reset upon transitions to InSpeech or upon confirming a clip end
+                    },
+                }
             }
         }
     }
 }
 
-//3 This is called once we have a batch of messages in a row. We write the raw ulaw file and then convert it to a wave using the next function.
+//This is called once we have a batch of messages in a row. We write the raw ulaw file and then convert it to a wave using the next function.
 async fn process_audio_batch(batch: Vec<(i32, String)>, last_sequence: i32) {
     // Concatenate base64 audio data
     let audio_data = batch.iter().map(|(_seq, data)| base64::decode(data).unwrap()).flatten().collect::<Vec<_>>();
@@ -104,11 +229,12 @@ async fn process_audio_batch(batch: Vec<(i32, String)>, last_sequence: i32) {
     convert_raw_to_wav(&raw_filename, &wav_filename).expect("Failed to convert raw to WAV");
 }
 
-//4 This converts the ulaw raw to a wav file
+//This converts the ulaw raw to a wav file
 fn convert_raw_to_wav(raw_path: &str, wav_path: &str) -> io::Result<()> {
     let output = Command::new("ffmpeg")
         .args([
             "-f", "mulaw",
+            "-y", // Automatically overwrite existing files without asking
             "-ar", "16000",
             "-ac", "1",
             "-i", raw_path,
@@ -125,26 +251,53 @@ fn convert_raw_to_wav(raw_path: &str, wav_path: &str) -> io::Result<()> {
 
     // Delete the old raw file
     match fs::remove_file(raw_path) {
-        Ok(_) => info!("Successfully deleted {}", raw_path),
+        Ok(_) => {
+            info!("Successfully deleted {}", raw_path)
+        },
         Err(e) => eprintln!("Failed to delete {}: {}", raw_path, e),
     }
 
     Ok(())
 }
 
-// Function to play a base64-encoded audio chunk
-fn play_base64_audio_chunk(base64_audio: &str) {
-    // Decode the base64 string
-    let audio_bytes = base64::decode(base64_audio).expect("Failed to decode base64 audio");
+//Convert ulaw encoded bytes to linear pulse code modulation values
+fn mulaw_to_pcm(mulaw: u8) -> i16 {
+    let mulaw = !mulaw;
+    let exponent = (mulaw >> 4) & 0x07;
+    // Ensure `sample` starts as an i16 to support negation later.
+    let mut sample = ((mulaw & 0x0F) as i16) << 1 | 0x21;
+    sample <<= exponent + 2;
+    sample -= 0x21;
 
-    // You would typically concatenate these bytes with previously received bytes here
+    if mulaw & 0x80 != 0 {
+        sample = -sample;
+    }
 
-    // For demonstration, play the decoded audio chunk immediately
-    // Note: This assumes the audio is in a format that the `Decoder` can understand
-    let cursor = Cursor::new(audio_bytes);
-    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-    let source = Decoder::new(cursor).unwrap();
-    stream_handle.play_raw(source.convert_samples()).unwrap();
+    sample
+}
 
-    // Note: In a real application, you'd want to manage playback more gracefully
+//Finding the maximum absolute value of the PCM samples in a chunk, which gives you the peak amplitude.
+fn calculate_amplitude(chunk: &[u8]) -> i16 {
+    chunk.iter()
+        .map(|&mulaw| mulaw_to_pcm(mulaw))
+        .map(|pcm| pcm.abs())
+        .max()
+        .unwrap_or(0)
+}
+
+async fn process_audio_clip(start_sequence: i32, end_sequence: i32) {
+    let messages = MESSAGES.lock().await; // Assuming MESSAGES is a Mutex<HashMap<i32, String>>
+    let mut batch: Vec<(i32, String)> = Vec::new();
+
+    // Collect messages within the specified range
+    for sequence_number in start_sequence..=end_sequence {
+        if let Some(message) = messages.get(&sequence_number) {
+            batch.push((sequence_number, message.clone())); // Clone the message string
+        }
+    }
+
+    // Now that you have the batch, you can process it
+    if !batch.is_empty() {
+        process_audio_batch(batch, end_sequence).await; // Adjust this call based on your actual function signature
+    }
 }
