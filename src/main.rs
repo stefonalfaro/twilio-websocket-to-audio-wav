@@ -51,7 +51,7 @@ enum AudioState {
 //Start a webserver to handle websockets
 #[tokio::main]
 async fn main() {
-    env::set_var("RUST_LOG", "info"); //info or warn
+    env::set_var("RUST_LOG", "warn"); //info or warn
     env_logger::init();
 
     // Define the WebSocket route
@@ -104,19 +104,19 @@ async fn handle_message(msg: &Message) {
             let payload = data["media"]["payload"].as_str().unwrap();  
             let audio_chunk = base64::decode(payload).expect("Failed to decode base64");
 
-            //1 Run the calculate amplitude and add to message queue in parallel
+            //3.1 Run the calculate amplitude and add to message queue in parallel
             let (amplitude, _) = tokio::join!(
                 calculate_amplitude(&audio_chunk),
                 insert_message_async(sequence_number, payload.to_string())
             );
 
-            //2 Run the Pause and Speach detection algorithms in parallel
+            //3.2 Run the Pause and Speach detection algorithms in parallel
             let (pause_detected, speach_detected) = tokio::join!(
                 pause_detection(amplitude),
                 speach_detection(amplitude)
             );
 
-            //2.1 Start and end detection. This is how we would know to send the .wav file to our voice to text service
+            //4 Start and end detection. This is how we would know to send the .wav file to our voice to text service
             if speach_detected || pause_detected //Import we only do this when there is a Speach detected or Pause detected event
             {
                 let mut state = AUDIO_CLIP_STATE.lock().await;
