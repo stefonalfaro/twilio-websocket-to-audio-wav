@@ -12,6 +12,8 @@ use lazy_static::lazy_static;
 use std::fs;
 use std::sync::Arc;
 use std::collections::HashMap;
+use serde::Deserialize;
+use warp::reject::Rejection;
 
 //Confiuration for Level 1 algorithm that analyzes the audio stream to detect speech when the amplitude is consectively above the AMPLITUDE_THRESHOLD for SEQUENCE_THRESHOLD
 const SPEACH_DETECTION_AMPLITUDE_THRESHOLD: i16 = 5000;
@@ -39,6 +41,13 @@ lazy_static! {
     static ref CURRENT_CLIP_START: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
 
     static ref MESSAGES: Mutex<HashMap<i32, String>> = Mutex::new(HashMap::new());
+
+    static ref CALL_MANAGER: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+}
+
+#[derive(Deserialize, Clone)]
+struct Config {
+    auth_token: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -48,12 +57,28 @@ enum AudioState {
     PostSpeech,
 }
 
+#[derive(Deserialize)]
+struct InitRequest {
+    call_sid: String,
+    jwt: String,
+}
+
+#[derive(Debug)]
+struct Unauthorized;
+
+impl warp::reject::Reject for Unauthorized {}
+
 //Start a webserver to handle websockets
 #[tokio::main]
 async fn main() {
     env::set_var("RUST_LOG", "warn"); //info or warn
     env_logger::init();
 
+    let config = load_config().expect("Failed to load config");
+    let shared_config = Arc::new(config); // Wrap the config in an Arc for efficient cloning
+    let auth_filter = with_auth(shared_config.clone());
+
+    
     // Define the WebSocket route
     let media = warp::path("media")
         .and(warp::ws())
@@ -61,11 +86,31 @@ async fn main() {
             ws.on_upgrade(|socket| handle_connection(socket))
         });
 
+    // HTTP route for intialzing calls
+    let initialization_route = warp::path("init")
+        .and(auth_filter)
+        .and(warp::post()) // Expect POST requests
+        .and(warp::any().map(move || Arc::clone(&shared_config))) // Use a direct call to clone the Arc for shared config
+        .and(warp::body::json()) // Parse the JSON body into an InitRequest struct
+        .and_then(initialize_call);
+
+    let routes = media.or(initialization_route);
+
     // Start the server
     let port = 5000;
-    warp::serve(media)
+    warp::serve(routes)
         .run(([0, 0, 0, 0], port))
         .await;
+}
+
+fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
+    // Read the file to a String
+    let config_str = fs::read_to_string("config/config.json")?;
+
+    // Deserialize the JSON string into the Config struct
+    let config: Config = serde_json::from_str(&config_str)?;
+
+    Ok(config)
 }
 
 //1 Handle WebSocket connection and pass messages to the handle_message
@@ -76,7 +121,8 @@ async fn handle_connection(ws: WebSocket) {
 
     let mut message_count: u64 = 0;
 
-    while let Some(result) = receiver.next().await {
+    while let Some(result) = receiver.next().await 
+    {
         match result {
             Ok(msg) => {
                 handle_message(&msg).await;
@@ -308,4 +354,30 @@ async fn speach_detection(amplitude: i16) -> bool {
         speech_queue.clear();
     }
     speech_detected
+}
+
+async fn initialize_call(shared_config: Arc<Config>, init_request: InitRequest) -> Result<impl warp::Reply, warp::Rejection> {
+    // Here, you can access `shared_config` and `init_request` to perform your initialization logic
+    println!("Received CallSid: {}, JWT: {}", init_request.call_sid, init_request.jwt);
+
+    let mut call_manager: tokio::sync::MutexGuard<'_, HashMap<String, String>> = CALL_MANAGER.lock().await;
+    call_manager.insert(init_request.call_sid, init_request.jwt);
+
+    // Respond with a success message or appropriate response
+    Ok(warp::reply::json(&"Ok"))
+}
+
+fn with_auth(config: Arc<Config>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+    warp::header::<String>("authorization")
+        .and_then(move |token: String| {
+            let config = config.clone();
+            async move {
+                if token == format!("Bearer {}", config.auth_token) {
+                    Ok(())
+                } else {
+                    Err(warp::reject::custom(Unauthorized))
+                }
+            }
+        })
+        .untuple_one() // This is used because `and_then` wraps the Ok type in a tuple, and we want to discard it since it's empty.
 }
